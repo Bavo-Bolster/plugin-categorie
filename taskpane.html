@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Snelle categorieën</title>
+<script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #242424; --muted: #616161; --line: #e5e5e5;
+    --hover: #f3f3f3; --accent: #0f6cbd; --accent-bg: #ebf3fc; --error: #a4262c;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1f1f1f; --fg: #f0f0f0; --muted: #adadad; --line: #383838;
+      --hover: #2d2d2d; --accent: #62abf5; --accent-bg: #1b2a3a; --error: #f1707b;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 14px/1.35 "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header { padding: 12px 12px 10px; border-bottom: 1px solid var(--line); }
+  .top { display: flex; align-items: center; gap: 8px; }
+  #count { font-size: 15px; font-weight: 600; flex: 1; }
+  #reload {
+    border: 0; background: none; color: var(--muted); cursor: pointer;
+    padding: 4px 6px; border-radius: 4px; font: inherit; font-size: 12px;
+  }
+  #reload:hover { background: var(--hover); color: var(--fg); }
+  #subject {
+    color: var(--muted); font-size: 12px; margin: 2px 0 10px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  #search {
+    width: 100%; padding: 7px 10px; font: inherit; color: var(--fg);
+    background: var(--bg); border: 1px solid var(--line); border-bottom: 2px solid var(--accent);
+    border-radius: 4px; outline: none;
+  }
+  #search:focus { border-color: var(--accent); }
+  #list { flex: 1; overflow-y: auto; padding: 4px 0 8px; }
+  h2 { font-size: 12px; font-weight: 600; color: var(--muted); margin: 12px 12px 4px; }
+  .row {
+    display: flex; align-items: center; gap: 10px; width: 100%;
+    padding: 7px 12px; border: 0; background: none; color: inherit;
+    font: inherit; text-align: left; cursor: pointer;
+  }
+  .row:hover { background: var(--hover); }
+  .row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .row[aria-checked="true"] { background: var(--accent-bg); }
+  .row.off { opacity: .55; cursor: default; }
+  .tag { flex: none; width: 16px; height: 16px; }
+  .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .state { flex: none; font-size: 12px; color: var(--muted); min-width: 28px; text-align: right; }
+  .row[aria-checked="true"] .state { color: var(--accent); font-size: 15px; font-weight: 600; }
+  .new .name { color: var(--accent); }
+  .empty { color: var(--muted); padding: 16px 12px; }
+  #status {
+    min-height: 0; padding: 0 12px; font-size: 12px; color: var(--muted);
+    border-top: 1px solid transparent;
+  }
+  #status:not(:empty) { padding: 8px 12px; border-top-color: var(--line); }
+  #status.error { color: var(--error); }
+  @media (prefers-reduced-motion: no-preference) {
+    .row { transition: background-color .12s; }
+  }
+</style>
+</head>
+<body>
+  <header>
+    <div class="top">
+      <div id="count">Laden…</div>
+      <button id="reload" type="button" title="Categorielijst opnieuw ophalen uit Outlook">Vernieuwen</button>
+    </div>
+    <div id="subject"></div>
+    <input id="search" type="search" placeholder="Zoek of maak een categorie" autocomplete="off" aria-label="Categorie zoeken">
+  </header>
+  <main id="list" role="menu" aria-label="Categorieën"></main>
+  <div id="status" role="status" aria-live="polite"></div>
+
+<script>
+(() => {
+  // Kleuren van Outlook-categorieën (Office.MailboxEnums.CategoryColor)
+  const COLORS = {
+    None: "transparent",
+    Preset0: "#d13438", Preset1: "#f7630c", Preset2: "#d9a06a", Preset3: "#ffb900",
+    Preset4: "#4caf50", Preset5: "#00b7c3", Preset6: "#8c9e3d", Preset7: "#0078d4",
+    Preset8: "#8764b8", Preset9: "#c30052", Preset10: "#69797e", Preset11: "#4a5459",
+    Preset12: "#a0a0a0", Preset13: "#6e6e6e", Preset14: "#3b3a39", Preset15: "#a4262c",
+    Preset16: "#ca5010", Preset17: "#8e562e", Preset18: "#c19c00", Preset19: "#107c10",
+    Preset20: "#038387", Preset21: "#5d6a1f", Preset22: "#004e8c", Preset23: "#5c2e91",
+    Preset24: "#881798"
+  };
+  const RECENT_KEY = "snelcat.recent";
+  const $ = (s) => document.querySelector(s);
+
+  const state = {
+    master: [],      // [{displayName, color}]
+    selected: [],    // [{id, subject}]
+    cats: new Map(), // itemId -> Set(categorieNamen)
+    query: "",
+    loading: false,
+    busy: false,
+    multi: false
+  };
+  let refreshToken = 0;
+  let refreshTimer = null;
+  let lock = Promise.resolve();
+
+  const call = (fn) => new Promise((resolve, reject) => {
+    fn((r) => r.status === Office.AsyncResultStatus.Succeeded ? resolve(r.value) : reject(r.error));
+  });
+  const norm = (s) => (s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+  const plural = (n) => n === 1 ? "1 mail" : `${n} mails`;
+
+  function status(msg, isError = false) {
+    const el = $("#status");
+    el.textContent = msg || "";
+    el.classList.toggle("error", !!isError);
+  }
+
+  function recentGet() {
+    try { return JSON.parse(localStorage.getItem(RECENT_KEY) || "[]"); } catch { return []; }
+  }
+  function recentPush(name) {
+    try {
+      const r = recentGet().filter((x) => x !== name);
+      r.unshift(name);
+      localStorage.setItem(RECENT_KEY, JSON.stringify(r.slice(0, 8)));
+    } catch { /* geen opslag beschikbaar: geen probleem */ }
+  }
+
+  // Eén item tegelijk laden (Outlook laat maar één geladen item toe)
+  function withItem(id, fn) {
+    const run = async () => {
+      const mb = Office.context.mailbox;
+      if (state.multi) {
+        let item;
+        try {
+          item = await call((cb) => mb.loadItemByIdAsync(id, cb));
+        } catch (e) {
+          if (state.selected.length === 1 && mb.item) return fn(mb.item);
+          throw e;
+        }
+        try { return await fn(item); }
+        finally { try { await call((cb) => item.unloadAsync(cb)); } catch { } }
+      }
+      if (!mb.item) throw new Error("Geen mail geopend");
+      return fn(mb.item);
+    };
+    const p = lock.then(run, run);
+    lock = p.catch(() => {});
+    return p;
+  }
+
+  async function loadMaster() {
+    try {
+      const v = await call((cb) => Office.context.mailbox.masterCategories.getAsync(cb));
+      state.master = (v || []).slice().sort((a, b) =>
+        a.displayName.localeCompare(b.displayName, "nl", { numeric: true, sensitivity: "base" }));
+    } catch (e) {
+      status("De categorielijst kon niet worden opgehaald: " + (e && e.message ? e.message : e), true);
+    }
+    render();
+  }
+
+  function scheduleRefresh() {
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(refreshSelection, 150);
+  }
+
+  async function refreshSelection() {
+    const token = ++refreshToken;
+    const mb = Office.context.mailbox;
+    let items = [];
+    try {
+      if (Office.context.requirements.isSetSupported("Mailbox", "1.13")) {
+        const sel = await call((cb) => mb.getSelectedItemsAsync(cb));
+        items = (sel || []).map((i) => ({ id: i.itemId, subject: i.subject }));
+      } else if (mb.item) {
+        items = [{ id: mb.item.itemId, subject: mb.item.subject }];
+      }
+    } catch {
+      if (mb.item) items = [{ id: mb.item.itemId, subject: mb.item.subject }];
+    }
+    if (token !== refreshToken) return;
+
+    state.selected = items;
+    state.cats = new Map();
+    state.loading = items.length > 0;
+    render();
+
+    for (let i = 0; i < items.length; i++) {
+      if (token !== refreshToken) return;
+      try {
+        const cats = await withItem(items[i].id, (it) => call((cb) => it.categories.getAsync(cb)));
+        state.cats.set(items[i].id, new Set((cats || []).map((c) => c.displayName)));
+      } catch {
+        state.cats.set(items[i].id, new Set());
+      }
+      if (items.length > 5) status(`Categorieën lezen… ${i + 1}/${items.length}`);
+    }
+    if (token !== refreshToken) return;
+    state.loading = false;
+    if (items.length > 5) status("");
+    render();
+  }
+
+  function countHave(name) {
+    let n = 0;
+    for (const i of state.selected) if (state.cats.get(i.id)?.has(name)) n++;
+    return n;
+  }
+
+  async function toggle(name) {
+    const items = state.selected;
+    if (!items.length) { status("Selecteer eerst een of meer mails.", true); return; }
+    if (state.loading) { status("Even geduld, de selectie wordt nog gelezen."); return; }
+    if (state.busy) return;
+
+    const removing = items.every((i) => state.cats.get(i.id)?.has(name));
+    state.busy = true;
+    render();
+    let fail = 0;
+    for (const i of items) {
+      const has = state.cats.get(i.id)?.has(name);
+      if (removing ? !has : has) continue;
+      try {
+        await withItem(i.id, (it) => call((cb) =>
+          removing ? it.categories.removeAsync([name], cb) : it.categories.addAsync([name], cb)));
+        const s = state.cats.get(i.id) || new Set();
+        removing ? s.delete(name) : s.add(name);
+        state.cats.set(i.id, s);
+      } catch { fail++; }
+    }
+    state.busy = false;
+    if (!removing) recentPush(name);
+
+    if (fail) status(`Bij ${plural(fail)} lukte het niet. Klik nog eens om opnieuw te proberen.`, true);
+    else status(removing ? `${name} verwijderd van ${plural(items.length)}`
+                         : `${name} toegevoegd aan ${plural(items.length)}`);
+
+    if (state.query) { state.query = ""; $("#search").value = ""; render(); $("#search").focus(); }
+    else render(name);
+  }
+
+  function guessColor(name) {
+    // Neemt de kleur over van een bestaande categorie met hetzelfde begin (bv. "p26")
+    const key = norm(name).slice(0, 3);
+    const match = state.master.find((c) => norm(c.displayName).startsWith(key));
+    return match ? match.color : Office.MailboxEnums.CategoryColor.Preset7;
+  }
+
+  async function createAndApply(name) {
+    name = name.trim();
+    if (!name) return;
+    try {
+      await call((cb) => Office.context.mailbox.masterCategories.addAsync(
+        [{ displayName: name, color: guessColor(name) }], cb));
+    } catch (e) {
+      status("De categorie kon niet worden gemaakt: " + (e && e.message ? e.message : e), true);
+      return;
+    }
+    await loadMaster();
+    if (state.selected.length) await toggle(name);
+    else { status(`Categorie ${name} gemaakt`); state.query = ""; $("#search").value = ""; render(); }
+  }
+
+  // ---------- weergave ----------
+  function tagIcon(color) {
+    const ns = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(ns, "svg");
+    svg.setAttribute("viewBox", "0 0 16 16");
+    svg.setAttribute("class", "tag");
+    svg.setAttribute("aria-hidden", "true");
+    const path = document.createElementNS(ns, "path");
+    path.setAttribute("d", "M1.5 4.5A1.5 1.5 0 0 1 3 3h6.4c.4 0 .78.16 1.06.44l3.6 3.6a1.5 1.5 0 0 1 0 2.12l-3.6 3.6c-.28.28-.66.44-1.06.44H3a1.5 1.5 0 0 1-1.5-1.5z");
+    const transparent = color === "transparent";
+    path.setAttribute("fill", transparent ? "none" : color);
+    path.setAttribute("stroke", transparent ? "currentColor" : color);
+    const hole = document.createElementNS(ns, "circle");
+    hole.setAttribute("cx", "10"); hole.setAttribute("cy", "8.1"); hole.setAttribute("r", "1.2");
+    hole.setAttribute("fill", "var(--bg)");
+    svg.append(path, hole);
+    return svg;
+  }
+
+  function span(cls, text) {
+    const s = document.createElement("span");
+    s.className = cls; s.textContent = text;
+    return s;
+  }
+
+  function row(cat) {
+    const n = state.selected.length;
+    const have = countHave(cat.displayName);
+    const st = n && have === n ? "true" : have > 0 ? "mixed" : "false";
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "row";
+    b.dataset.name = cat.displayName;
+    b.setAttribute("role", "menuitemcheckbox");
+    b.setAttribute("aria-checked", st);
+    const off = !n || state.loading || state.busy;
+    if (off) { b.classList.add("off"); b.setAttribute("aria-disabled", "true"); }
+    b.title = !n ? "Selecteer eerst een of meer mails"
+            : st === "true" ? "Klik om te verwijderen van de selectie"
+            : "Klik om toe te voegen aan de selectie";
+    b.append(tagIcon(COLORS[cat.color] || COLORS.None), span("name", cat.displayName),
+             span("state", st === "true" ? "✓" : st === "mixed" ? `${have}/${n}` : ""));
+    b.addEventListener("click", () => toggle(cat.displayName));
+    return b;
+  }
+
+  function newRow(name) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "row new";
+    b.setAttribute("role", "menuitem");
+    b.append(span("tag", "+"), span("name", `Nieuwe categorie “${name}”`), span("state", ""));
+    b.addEventListener("click", () => createAndApply(name));
+    return b;
+  }
+
+  function heading(text) {
+    const h = document.createElement("h2");
+    h.textContent = text;
+    return h;
+  }
+
+  function render(focusName) {
+    const n = state.selected.length;
+    $("#count").textContent = n === 0 ? "Geen mail geselecteerd"
+                            : n === 1 ? "1 mail geselecteerd" : `${n} mails geselecteerd`;
+    $("#subject").textContent = n === 1 ? (state.selected[0].subject || "(geen onderwerp)")
+                              : n > 1 ? "Een klik voegt toe aan alle geselecteerde mails"
+                              : "Selecteer een of meer mails in je lijst";
+
+    const list = $("#list");
+    list.replaceChildren();
+    const q = norm(state.query.trim());
+
+    if (q) {
+      const hits = state.master.filter((c) => norm(c.displayName).includes(q));
+      hits.sort((a, b) => norm(b.displayName).startsWith(q) - norm(a.displayName).startsWith(q));
+      hits.forEach((c) => list.append(row(c)));
+      if (!state.master.some((c) => norm(c.displayName) === q)) list.append(newRow(state.query.trim()));
+    } else if (!state.master.length) {
+      const p = document.createElement("div");
+      p.className = "empty";
+      p.textContent = "Nog geen categorieën. Typ hierboven een naam om er een te maken.";
+      list.append(p);
+    } else {
+      const onSel = state.master.filter((c) => countHave(c.displayName) > 0);
+      if (onSel.length) {
+        list.append(heading(n === 1 ? "Op deze mail" : "Op de selectie"));
+        onSel.forEach((c) => list.append(row(c)));
+      }
+      const recent = recentGet()
+        .map((name) => state.master.find((c) => c.displayName === name))
+        .filter((c) => c && !onSel.includes(c))
+        .slice(0, 5);
+      if (recent.length) {
+        list.append(heading("Recent gebruikt"));
+        recent.forEach((c) => list.append(row(c)));
+      }
+      list.append(heading("Alle categorieën"));
+      state.master.forEach((c) => list.append(row(c)));
+    }
+
+    if (focusName) {
+      const el = [...list.querySelectorAll(".row")].find((r) => r.dataset.name === focusName);
+      if (el) el.focus();
+    }
+  }
+
+  function bindUi() {
+    const search = $("#search");
+    search.addEventListener("input", () => { state.query = search.value; render(); });
+    search.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        const first = $("#list .row");
+        if (first) first.click();
+      } else if (e.key === "ArrowDown") {
+        e.preventDefault();
+        const first = $("#list .row");
+        if (first) first.focus();
+      } else if (e.key === "Escape") {
+        search.value = ""; state.query = ""; render();
+      }
+    });
+    $("#list").addEventListener("keydown", (e) => {
+      if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+      const rows = [...document.querySelectorAll("#list .row")];
+      const i = rows.indexOf(document.activeElement);
+      if (i < 0) return;
+      e.preventDefault();
+      if (e.key === "ArrowUp" && i === 0) search.focus();
+      else rows[Math.max(0, Math.min(rows.length - 1, i + (e.key === "ArrowDown" ? 1 : -1)))].focus();
+    });
+    $("#reload").addEventListener("click", async () => {
+      await loadMaster();
+      await refreshSelection();
+      status("Lijst vernieuwd");
+    });
+  }
+
+  Office.onReady((info) => {
+    bindUi();
+    if (info.host !== Office.HostType.Outlook) {
+      $("#count").textContent = "Open dit in Outlook";
+      return;
+    }
+    const req = Office.context.requirements;
+    const mb = Office.context.mailbox;
+    state.multi = req.isSetSupported("Mailbox", "1.15");
+    if (req.isSetSupported("Mailbox", "1.13")) {
+      mb.addHandlerAsync(Office.EventType.SelectedItemsChanged, scheduleRefresh);
+    }
+    if (req.isSetSupported("Mailbox", "1.5")) {
+      mb.addHandlerAsync(Office.EventType.ItemChanged, scheduleRefresh);
+    }
+    loadMaster().then(refreshSelection);
+    $("#search").focus();
+  });
+})();
+</script>
+</body>
+</html>
